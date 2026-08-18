@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OPPOSE — Интеллектуальный ринг</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="noise-overlay" aria-hidden="true"></div>
+
+<!-- ============ ЭКРАН 1 — ГЛАВНОЕ МЕНЮ ============ -->
+<section id="screen-menu" class="screen">
+  <div class="menu-wrap">
+
+    <header class="logo-block">
+      <div class="logo-mark" aria-hidden="true">
+        <span class="logo-bracket">[</span><span class="logo-vs">OPPOSE</span><span class="logo-bracket">]</span>
+      </div>
+      <p class="logo-tag">интеллектуальный 1v1 видеочат-ринг</p>
+    </header>
+
+    <div class="user-card glass">
+      <div class="user-avatar">
+        <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="24" cy="24" r="23" stroke="url(#avatarRing)" stroke-width="2"/>
+          <circle cx="24" cy="17" r="7" fill="#ff2a5f" fill-opacity="0.85"/>
+          <path d="M9 40c2-8 8-12 15-12s13 4 15 12" stroke="#ff2a5f" stroke-width="2" fill="none"/>
+          <defs>
+            <linearGradient id="avatarRing" x1="0" y1="0" x2="48" y2="48">
+              <stop offset="0%" stop-color="#ff2a5f"/>
+              <stop offset="100%" stop-color="#2ad4ff"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+      <div class="user-info">
+        <div class="user-name">Гость Ринга</div>
+        <div class="user-rank" id="userRank">Словесный Боец</div>
+        <div class="elo-row">
+          <span class="elo-value" id="userElo">1 000</span>
+          <span class="elo-label">ELO</span>
+        </div>
+        <div class="elo-bar" aria-hidden="true"><span id="eloBarFill" style="width:46%"></span></div>
+      </div>
+    </div>
+
+    <div class="category-block">
+      <span class="section-eyebrow">Категория боя</span>
+      <div class="toggle-group" id="categoryToggle" role="radiogroup" aria-label="Категория боя">
+        <button type="button" class="toggle-opt active" data-cat="light" role="radio" aria-checked="true">
+          <span class="toggle-dot"></span>Лайт
+        </button>
+        <button type="button" class="toggle-opt" data-cat="hardcore" role="radio" aria-checked="false">
+          <span class="toggle-dot"></span>Хардкор
+        </button>
+      </div>
+      <p class="category-hint" id="categoryHint">Бытовые темы. Разогрев без крови на ринге.</p>
+    </div>
+
+    <button type="button" id="btnFight" class="btn-fight">
+      <span class="btn-fight-glyph">⚔</span>
+      <span>В БОЙ</span>
+    </button>
+
+    <p class="menu-footnote">Найдём оппонента с противоположной позицией за секунды</p>
+  </div>
+</section>
+
+<!-- ============ ЭКРАН 2 — MATCHMAKING ============ -->
+<section id="screen-matchmaking" class="screen hidden">
+  <div class="mm-wrap">
+    <div class="radar" aria-hidden="true">
+      <div class="radar-ring r1"></div>
+      <div class="radar-ring r2"></div>
+      <div class="radar-ring r3"></div>
+      <div class="radar-sweep"></div>
+      <div class="radar-core"></div>
+      <div class="radar-blip b1"></div>
+      <div class="radar-blip b2"></div>
+    </div>
+    <h2 class="mm-title">Ищем оппонента<span class="dots"><span>.</span><span>.</span><span>.</span></span></h2>
+    <p class="mm-subtitle">Подбираем противоположную позицию</p>
+    <p class="mm-elapsed"><span id="mmTimer">00:00</span> · категория «<span id="mmCategory">Лайт</span>»</p>
+    <button type="button" id="btnCancelSearch" class="btn-ghost">Отмена</button>
+  </div>
+</section>
+
+<!-- ============ ЭКРАН 3 — РИНГ / БОЙ ============ -->
+<section id="screen-ring" class="screen hidden">
+  <div class="ring-wrap">
+
+    <div class="ring-topbar glass">
+      <div class="topbar-topic">
+        <span class="section-eyebrow">Тема раунда</span>
+        <h2 id="ringTopic">Удалёнка убивает продуктивность</h2>
+      </div>
+      <div class="topbar-role" id="ringRole">Ты: <strong>ЗА</strong></div>
+    </div>
+
+    <div class="ring-timer-block">
+      <svg class="timer-ring" viewBox="0 0 120 120" aria-hidden="true">
+        <circle class="timer-track" cx="60" cy="60" r="52"></circle>
+        <circle class="timer-progress" id="timerProgress" cx="60" cy="60" r="52"></circle>
+      </svg>
+      <div class="timer-center">
+        <span class="timer-value" id="timerValue">00:30</span>
+        <span class="timer-phase" id="timerPhase">Подготовка</span>
+      </div>
+    </div>
+
+    <div class="split-screen">
+      <div class="fighter-panel you">
+        <div class="video-frame">
+          <div class="video-corner tl"></div><div class="video-corner tr"></div>
+          <div class="video-corner bl"></div><div class="video-corner br"></div>
+          <div class="video-placeholder">
+            <div class="avatar-glow you-glow"></div>
+            <span class="video-initial">Т</span>
+          </div>
+          <div class="video-label">Ты</div>
+          <div class="mic-indicator" id="micYou" aria-hidden="true"></div>
+        </div>
+      </div>
+
+      <div class="vs-divider" aria-hidden="true">VS</div>
+
+      <div class="fighter-panel opp">
+        <div class="video-frame">
+          <div class="video-corner tl"></div><div class="video-corner tr"></div>
+          <div class="video-corner bl"></div><div class="video-corner br"></div>
+          <div class="video-placeholder">
+            <div class="avatar-glow opp-glow"></div>
+            <span class="video-initial">О</span>
+          </div>
+          <div class="video-label">Оппонент</div>
+          <div class="mic-indicator" id="micOpp" aria-hidden="true"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ai-hint-widget glass" id="aiHintWidget">
+      <span class="ai-hint-glyph">💡</span>
+      <span class="ai-hint-text" id="aiHintText">Подсказка ИИ: обозначь тезис в первые 10 секунд — судья оценивает структуру.</span>
+    </div>
+
+    <button type="button" id="btnEndFight" class="btn-end">Завершить бой</button>
+  </div>
+</section>
+
+<!-- ============ ЭКРАН 4 — ВЕРДИКТ ИИ ============ -->
+<section id="screen-verdict" class="screen hidden">
+  <div class="verdict-backdrop"></div>
+  <div class="verdict-modal glass" role="dialog" aria-modal="true" aria-labelledby="verdictOutcome">
+    <div class="verdict-judge-mark" aria-hidden="true">⚖</div>
+    <span class="section-eyebrow">Вердикт ИИ-судьи</span>
+    <h2 id="verdictOutcome" class="verdict-outcome">Победа</h2>
+
+    <p class="verdict-text" id="verdictText">
+      Твоя аргументация была структурнее: ты держался тезиса и подкреплял его примерами, тогда как оппонент чаще уходил в эмоции.
+    </p>
+
+    <div class="elo-change-card">
+      <span class="elo-change-label">Изменение рейтинга</span>
+      <span class="elo-change-value" id="eloChangeValue">+25 ELO</span>
+      <span class="elo-change-total">1 000 → <span id="eloNewTotal">1 025</span></span>
+    </div>
+
+    <button type="button" id="btnReturnMenu" class="btn-fight">Вернуться в меню</button>
+  </div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
