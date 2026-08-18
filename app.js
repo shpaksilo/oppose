@@ -2,6 +2,20 @@
   'use strict';
 
   /* ============================================================
+     Supabase
+     ============================================================ */
+  const SUPABASE_URL = 'https://gjyuudqxbimumpnsesky.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_Q9Y4HCWbc-_tG3-32GB0PQ_x9sYJIIF';
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  const QUEUE_TABLE = 'matchmaking_queue';
+  const SEARCH_TIMEOUT_MS = 30000;
+
+  function generateId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'id-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+
+  /* ============================================================
      State
      ============================================================ */
   const state = {
@@ -9,11 +23,16 @@
     category: 'light',
     searchTimer: null,
     searchSeconds: 0,
+    matchTimeout: null,
     phaseIndex: 0,
     phaseRemaining: 0,
     phaseTimer: null,
     hintTimer: null,
     role: 'ЗА',
+
+    myId: null,
+    queueChannel: null,
+    roomId: null,
   };
 
   const RANKS = [
@@ -28,6 +47,8 @@
     light: 'Бытовые темы. Разогрев без крови на ринге.',
     hardcore: 'Острые темы, жёсткий тайминг. Судья строже к воде в речи.',
   };
+
+  const CATEGORY_LABELS = { light: 'Лайт', hardcore: 'Хардкор' };
 
   const TOPICS = {
     light: [
@@ -82,9 +103,12 @@
     categoryHint: document.getElementById('categoryHint'),
     btnFight: document.getElementById('btnFight'),
 
+    mmSearching: document.getElementById('mmSearching'),
+    mmTimeout: document.getElementById('mmTimeout'),
     mmTimer: document.getElementById('mmTimer'),
     mmCategory: document.getElementById('mmCategory'),
     btnCancelSearch: document.getElementById('btnCancelSearch'),
+    btnBackFromTimeout: document.getElementById('btnBackFromTimeout'),
 
     ringTopic: document.getElementById('ringTopic'),
     ringRole: document.getElementById('ringRole'),
@@ -110,6 +134,12 @@
     Object.entries(screens).forEach(([key, node]) => {
       node.classList.toggle('hidden', key !== name);
     });
+  }
+
+  function showMatchmakingView(view) {
+    // view: 'searching' | 'timeout'
+    el.mmSearching.classList.toggle('hidden', view !== 'searching');
+    el.mmTimeout.classList.toggle('hidden', view !== 'timeout');
   }
 
   /* ============================================================
@@ -162,40 +192,180 @@
   el.btnFight.addEventListener('click', startMatchmaking);
 
   /* ============================================================
-     Screen 2 — Matchmaking
+     Screen 2 — Matchmaking (Supabase-backed)
      ============================================================ */
-  function startMatchmaking() {
+  async function startMatchmaking() {
+    state.myId = generateId();
+    state.roomId = null;
+    const categoryLabel = CATEGORY_LABELS[state.category];
+
     state.searchSeconds = 0;
     el.mmTimer.textContent = '00:00';
-    el.mmCategory.textContent = state.category === 'light' ? 'Лайт' : 'Хардкор';
+    el.mmCategory.textContent = categoryLabel;
+    showMatchmakingView('searching');
     showScreen('matchmaking');
 
+    clearInterval(state.searchTimer);
     state.searchTimer = setInterval(() => {
       state.searchSeconds += 1;
       el.mmTimer.textContent = formatMMSS(state.searchSeconds);
     }, 1000);
 
-    // Simulated opponent found after a short random delay
-    const delay = 2200 + Math.random() * 2200;
-    state.searchTimeout = setTimeout(() => {
-      clearInterval(state.searchTimer);
-      enterRing();
-    }, delay);
+    // Give up and show the "opponents are busy" state if nobody is
+    // found within SEARCH_TIMEOUT_MS.
+    clearTimeout(state.matchTimeout);
+    state.matchTimeout = setTimeout(() => {
+      giveUpSearch();
+    }, SEARCH_TIMEOUT_MS);
+
+    // 1. Listen for our own queue row being matched by someone else,
+    //    before we insert it, so we never miss a fast match.
+    subscribeToOwnRow(state.myId);
+
+    try {
+      // 2. Put ourselves in the queue as 'waiting'.
+      const { error: insertError } = await sb.from(QUEUE_TABLE).insert({
+        id: state.myId,
+        status: 'waiting',
+        category: categoryLabel,
+      });
+      if (insertError) throw insertError;
+
+      // 3. Look for another waiting player in the same category.
+      const { data: candidates, error: selectError } = await sb
+        .from(QUEUE_TABLE)
+        .select('id')
+        .eq('status', 'waiting')
+        .eq('category', categoryLabel)
+        .neq('id', state.myId)
+        .order('created_at', { ascending: true })
+        .limit(1);
+      if (selectError) throw selectError;
+
+      const opponent = candidates && candidates[0];
+      if (opponent) {
+        await matchWithOpponent(opponent.id, categoryLabel);
+      }
+      // If nobody is waiting yet, we sit in 'waiting' and let the
+      // realtime subscription (or the 30s timeout) take it from here.
+    } catch (err) {
+      console.error('OPPOSE matchmaking error:', err);
+    }
   }
 
-  el.btnCancelSearch.addEventListener('click', () => {
+  function subscribeToOwnRow(myId) {
+    if (state.queueChannel) {
+      sb.removeChannel(state.queueChannel);
+      state.queueChannel = null;
+    }
+    state.queueChannel = sb
+      .channel(`queue-${myId}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: QUEUE_TABLE, filter: `id=eq.${myId}` },
+        (payload) => {
+          const row = payload.new;
+          if (row && row.status === 'matched') {
+            enterRingFromMatch(row);
+          }
+        }
+      )
+      .subscribe();
+  }
+
+  async function matchWithOpponent(opponentId, categoryLabel) {
+    const categoryKey = categoryLabel === 'Хардкор' ? 'hardcore' : 'light';
+    const roomId = generateId();
+    const topic = pick(TOPICS[categoryKey]);
+    const myRole = Math.random() < 0.5 ? 'ЗА' : 'ПРОТИВ';
+    const oppRole = myRole === 'ЗА' ? 'ПРОТИВ' : 'ЗА';
+
+    // Claim the opponent first — only succeeds if they're still waiting,
+    // which avoids double-matching the same player.
+    const { data: claimed, error: claimError } = await sb
+      .from(QUEUE_TABLE)
+      .update({ status: 'matched', room_id: roomId, role: oppRole, topic, opponent_id: state.myId })
+      .eq('id', opponentId)
+      .eq('status', 'waiting')
+      .select();
+    if (claimError) throw claimError;
+    if (!claimed || claimed.length === 0) {
+      // Opponent got claimed by someone else first — keep waiting for
+      // our own row to be matched instead.
+      return;
+    }
+
+    const { error: selfError } = await sb
+      .from(QUEUE_TABLE)
+      .update({ status: 'matched', room_id: roomId, role: myRole, topic, opponent_id: opponentId })
+      .eq('id', state.myId);
+    if (selfError) throw selfError;
+
+    // Our own realtime subscription will also receive this UPDATE and call
+    // enterRingFromMatch — but we transition immediately for zero lag.
+    enterRingFromMatch({ status: 'matched', room_id: roomId, role: myRole, topic });
+  }
+
+  let ringEntered = false;
+  function enterRingFromMatch(row) {
+    if (ringEntered) return; // guard against double-trigger (self update + realtime echo)
+    ringEntered = true;
+
     clearInterval(state.searchTimer);
-    clearTimeout(state.searchTimeout);
+    clearTimeout(state.matchTimeout);
+    if (state.queueChannel) {
+      sb.removeChannel(state.queueChannel);
+      state.queueChannel = null;
+    }
+    state.roomId = row.room_id;
+    enterRing(row.topic, row.role);
+  }
+
+  async function giveUpSearch() {
+    clearInterval(state.searchTimer);
+    if (state.queueChannel) {
+      sb.removeChannel(state.queueChannel);
+      state.queueChannel = null;
+    }
+    if (state.myId) {
+      try {
+        await sb.from(QUEUE_TABLE).delete().eq('id', state.myId).eq('status', 'waiting');
+      } catch (err) {
+        console.error('OPPOSE search-timeout cleanup error:', err);
+      }
+    }
+    showMatchmakingView('timeout');
+  }
+
+  el.btnCancelSearch.addEventListener('click', async () => {
+    clearInterval(state.searchTimer);
+    clearTimeout(state.matchTimeout);
+    if (state.queueChannel) {
+      sb.removeChannel(state.queueChannel);
+      state.queueChannel = null;
+    }
+    if (state.myId) {
+      try {
+        await sb.from(QUEUE_TABLE).delete().eq('id', state.myId);
+      } catch (err) {
+        console.error('OPPOSE cancel-search error:', err);
+      }
+    }
+    showScreen('menu');
+  });
+
+  el.btnBackFromTimeout.addEventListener('click', () => {
+    showMatchmakingView('searching');
     showScreen('menu');
   });
 
   /* ============================================================
      Screen 3 — Ring / fight
      ============================================================ */
-  function enterRing() {
-    const topicPool = TOPICS[state.category];
-    el.ringTopic.textContent = pick(topicPool);
-    state.role = Math.random() < 0.5 ? 'ЗА' : 'ПРОТИВ';
+  function enterRing(topic, role) {
+    ringEntered = false; // reset guard for the next matchmaking cycle
+    el.ringTopic.textContent = topic || pick(TOPICS[state.category]);
+    state.role = role || (Math.random() < 0.5 ? 'ЗА' : 'ПРОТИВ');
     el.ringRole.innerHTML = `Ты: <strong>${state.role}</strong>`;
 
     state.phaseIndex = 0;
@@ -272,6 +442,14 @@
 
     state.elo = newElo;
     showScreen('verdict');
+
+    // Best-effort cleanup of our queue row now that the fight is over.
+    if (state.myId) {
+      sb.from(QUEUE_TABLE).delete().eq('id', state.myId).then(
+        () => {},
+        (err) => console.error('OPPOSE cleanup error:', err)
+      );
+    }
   }
 
   el.btnReturnMenu.addEventListener('click', () => {
