@@ -28,6 +28,7 @@
 
   const QUEUE_TABLE = 'matchmaking_queue';
   const SEARCH_TIMEOUT_MS = 30000;
+  const RING_ENTRY_GRACE_MS = 5000; // ignore ParticipantDisconnected noise right after joining
 
   /* ============================================================
      2. User identity (persisted in localStorage)
@@ -73,6 +74,7 @@
     myQueueRowId: null,
     ringEntered: false,
     livekitRoom: null,
+    roomConnectedAt: null,
     opponentLeft: false,
   };
 
@@ -546,7 +548,7 @@
     state.livekitRoom = room;
 
     room.on(LK.RoomEvent.TrackSubscribed, (track, publication, participant) => {
-      console.log('[OPPOSE] TrackSubscribed: kind=%s from=%s', track.kind, participant.identity);
+      console.log('[OPPOSE] Event: TrackSubscribed — kind=%s from=%s', track.kind, participant.identity);
       if (track.kind === 'video') {
         track.attach(el.remoteVideo);
         showVideoTrack(el.remoteVideo, el.videoPlaceholderOpp);
@@ -556,28 +558,80 @@
     });
 
     room.on(LK.RoomEvent.TrackUnsubscribed, (track) => {
-      console.log('[OPPOSE] TrackUnsubscribed: kind=%s', track.kind);
+      console.log('[OPPOSE] Event: TrackUnsubscribed — kind=%s', track.kind);
       track.detach();
     });
 
+    // Full connection-lifecycle logging so the real cause of any drop is
+    // visible in the console instead of us having to guess.
+    room.on(LK.RoomEvent.Connected, () => {
+      console.log('[OPPOSE] Event: Connected. Remote participants already in room:', room.remoteParticipants.size);
+    });
+
+    room.on(LK.RoomEvent.ParticipantConnected, (participant) => {
+      console.log('[OPPOSE] Event: ParticipantConnected —', participant.identity);
+    });
+
+    room.on(LK.RoomEvent.Reconnecting, () => {
+      console.warn('[OPPOSE] Event: Reconnecting to LiveKit...');
+    });
+
+    room.on(LK.RoomEvent.Reconnected, () => {
+      console.log('[OPPOSE] Event: Reconnected to LiveKit.');
+    });
+
+    room.on(LK.RoomEvent.ConnectionStateChanged, (connectionState) => {
+      console.log('[OPPOSE] Event: ConnectionStateChanged ->', connectionState);
+    });
+
     // 5. Auto-sync: opponent leaving the room.
+    // A fresh join can momentarily fire ParticipantDisconnected for a stale
+    // duplicate session (e.g. the same userId reconnecting from another
+    // tab/reload), so we (a) ignore this event for a short grace period
+    // right after connecting, and (b) double-check that the room is
+    // actually empty of other participants before showing "Связь потеряна".
     room.on(LK.RoomEvent.ParticipantDisconnected, (participant) => {
-      console.warn('[OPPOSE] ParticipantDisconnected:', participant.identity);
-      handleOpponentLeft();
+      const elapsed = state.roomConnectedAt ? Date.now() - state.roomConnectedAt : Infinity;
+      console.warn(
+        '[OPPOSE] Event: ParticipantDisconnected — identity=%s, %dms after connecting',
+        participant.identity,
+        elapsed
+      );
+
+      if (elapsed < RING_ENTRY_GRACE_MS) {
+        console.warn(
+          '[OPPOSE] Ignoring — inside the %dms post-join grace period (likely a stale duplicate session, not the real opponent).',
+          RING_ENTRY_GRACE_MS
+        );
+        return;
+      }
+
+      // Give the room's participant map a beat to settle, then confirm
+      // nobody else is actually left before declaring the opponent gone.
+      setTimeout(() => {
+        const remaining = room.remoteParticipants ? room.remoteParticipants.size : 0;
+        console.log('[OPPOSE] Remote participants remaining after disconnect event:', remaining);
+        if (remaining === 0) {
+          handleOpponentLeft();
+        } else {
+          console.log('[OPPOSE] Another remote participant is still connected — not treating this as the opponent leaving.');
+        }
+      }, 300);
     });
 
     room.on(LK.RoomEvent.Disconnected, (reason) => {
-      console.log('[OPPOSE] LiveKit room disconnected. reason=', reason);
+      console.log('[OPPOSE] Event: Disconnected. reason=%s', reason);
     });
 
     room.on(LK.RoomEvent.MediaDevicesError, (err) => {
-      console.error('[OPPOSE] MediaDevicesError:', err);
+      console.error('[OPPOSE] Event: MediaDevicesError:', err);
       showRingError('Нет доступа к камере/микрофону: ' + (err.message || 'проверь разрешения браузера'));
     });
 
     try {
       console.log('[OPPOSE] Step: connecting to LiveKit room at %s...', LIVEKIT_URL);
       await room.connect(LIVEKIT_URL, token);
+      state.roomConnectedAt = Date.now();
       console.log('[OPPOSE] Connected to LiveKit room:', room.name);
 
       console.log('[OPPOSE] Step: requesting camera + microphone access...');
@@ -627,6 +681,7 @@
         console.error('[OPPOSE] Error while disconnecting LiveKit room:', err);
       }
       state.livekitRoom = null;
+      state.roomConnectedAt = null;
     }
     resetVideoTrack(el.localVideo, el.videoPlaceholderYou);
     resetVideoTrack(el.remoteVideo, el.videoPlaceholderOpp);
