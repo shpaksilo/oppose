@@ -76,6 +76,8 @@
     livekitRoom: null,
     roomConnectedAt: null,
     localTracks: [],
+    opponentLeftCheckTimer: null,
+    isMatchActive: false,
     opponentLeft: false,
   };
 
@@ -199,6 +201,10 @@
   }
 
   function hideOpponentLeftOverlay() {
+    if (state.opponentLeftCheckTimer) {
+      clearTimeout(state.opponentLeftCheckTimer);
+      state.opponentLeftCheckTimer = null;
+    }
     if (!el.opponentLeftBackdrop || !el.opponentLeftModal) return;
     el.opponentLeftBackdrop.classList.add('hidden');
     el.opponentLeftBackdrop.style.display = 'none';
@@ -526,6 +532,11 @@
      4. LiveKit video chat
      ============================================================ */
   async function connectToLiveKit(roomId) {
+    // 1. Hard-hide the "opponent left" modal the moment we start connecting
+    // a new match — it must never be able to sit on top of a fresh call.
+    hideOpponentLeftOverlay();
+    state.isMatchActive = false;
+
     if (!LK) {
       showRingError('Видео недоступно: LiveKit SDK не загружен.');
       return;
@@ -615,6 +626,13 @@
 
     room.on(LK.RoomEvent.ParticipantConnected, (participant) => {
       console.log('[OPPOSE] Event: ParticipantConnected —', participant.identity);
+      // Someone (re)joined — whatever earlier disconnect we were about to
+      // confirm is stale noise, not a real departure. Cancel it.
+      if (state.opponentLeftCheckTimer) {
+        console.log('[OPPOSE] Cancelling pending opponent-left check — a participant (re)connected.');
+        clearTimeout(state.opponentLeftCheckTimer);
+        state.opponentLeftCheckTimer = null;
+      }
     });
 
     room.on(LK.RoomEvent.Reconnecting, () => {
@@ -630,38 +648,32 @@
     });
 
     // 5. Auto-sync: opponent leaving the room.
-    // A fresh join can momentarily fire ParticipantDisconnected for a stale
-    // duplicate session (e.g. the same userId reconnecting from another
-    // tab/reload), so we (a) ignore this event for a short grace period
-    // right after connecting, and (b) double-check that the room is
-    // actually empty of other participants before showing "Связь потеряна".
+    // Rule: show the "opponent left" modal ONLY when a ParticipantDisconnected
+    // event has fired, the match is actually active, AND the room is
+    // physically empty of other participants right now — otherwise it's
+    // noise (a duplicate/stale session dropping while the real opponent is
+    // still connected) and we ignore it outright. If it does look like a
+    // real departure, we still don't act on it immediately: we schedule one
+    // confirmation pinned to RING_ENTRY_GRACE_MS (5s) after connecting, and
+    // a later ParticipantConnected cancels it.
     room.on(LK.RoomEvent.ParticipantDisconnected, (participant) => {
-      const elapsed = state.roomConnectedAt ? Date.now() - state.roomConnectedAt : Infinity;
-      console.warn(
-        '[OPPOSE] Event: ParticipantDisconnected — identity=%s, %dms after connecting',
-        participant.identity,
-        elapsed
-      );
+      console.warn('[OPPOSE] Event: ParticipantDisconnected — identity=%s', participant.identity);
 
-      if (elapsed < RING_ENTRY_GRACE_MS) {
-        console.warn(
-          '[OPPOSE] Ignoring — inside the %dms post-join grace period (likely a stale duplicate session, not the real opponent).',
-          RING_ENTRY_GRACE_MS
+      if (!state.isMatchActive) {
+        console.log('[OPPOSE] Ignoring — no active match right now (isMatchActive=false).');
+        return;
+      }
+
+      const remainingNow = room.remoteParticipants ? room.remoteParticipants.size : 0;
+      if (remainingNow > 0) {
+        console.log(
+          '[OPPOSE] Ignoring — room.remoteParticipants.size=%d, the opponent is still physically in the room.',
+          remainingNow
         );
         return;
       }
 
-      // Give the room's participant map a beat to settle, then confirm
-      // nobody else is actually left before declaring the opponent gone.
-      setTimeout(() => {
-        const remaining = room.remoteParticipants ? room.remoteParticipants.size : 0;
-        console.log('[OPPOSE] Remote participants remaining after disconnect event:', remaining);
-        if (remaining === 0) {
-          handleOpponentLeft();
-        } else {
-          console.log('[OPPOSE] Another remote participant is still connected — not treating this as the opponent leaving.');
-        }
-      }, 300);
+      scheduleOpponentLeftCheck(room);
     });
 
     room.on(LK.RoomEvent.Disconnected, (reason) => {
@@ -678,7 +690,8 @@
       console.log('[OPPOSE] Step: connecting to LiveKit room at %s...', LIVEKIT_URL);
       await room.connect(LIVEKIT_URL, token);
       state.roomConnectedAt = Date.now();
-      console.log('[OPPOSE] Connected to LiveKit room:', room.name);
+      state.isMatchActive = true;
+      console.log('[OPPOSE] Connected to LiveKit room:', room.name, '— isMatchActive=true');
       clearRingError();
       // 1. Guaranteed cleanup on successful connect: the "opponent left"
       // modal (if it somehow survived from a previous match) must not sit
@@ -735,6 +748,11 @@
   }
 
   function disconnectLiveKit() {
+    state.isMatchActive = false;
+    if (state.opponentLeftCheckTimer) {
+      clearTimeout(state.opponentLeftCheckTimer);
+      state.opponentLeftCheckTimer = null;
+    }
     if (state.localTracks && state.localTracks.length) {
       console.log('[OPPOSE] Stopping locally-acquired tracks (published or not)...');
       state.localTracks.forEach((track) => {
@@ -747,6 +765,15 @@
       state.localTracks = [];
     }
     if (state.livekitRoom) {
+      // 2. Strip every listener from the outgoing room BEFORE disconnecting
+      // it, so any in-flight event from the old call (e.g. a delayed
+      // ParticipantDisconnected) can never reach and affect the next match.
+      console.log('[OPPOSE] Removing all listeners from the outgoing LiveKit room...');
+      try {
+        state.livekitRoom.removeAllListeners();
+      } catch (err) {
+        console.error('[OPPOSE] Error removing listeners from LiveKit room:', err);
+      }
       console.log('[OPPOSE] Disconnecting from LiveKit room...');
       try {
         state.livekitRoom.disconnect();
@@ -759,6 +786,32 @@
     resetVideoTrack(el.localVideo, el.videoPlaceholderYou);
     resetVideoTrack(el.remoteVideo, el.videoPlaceholderOpp);
     if (el.remoteAudio) el.remoteAudio.srcObject = null;
+  }
+
+  function scheduleOpponentLeftCheck(room) {
+    clearTimeout(state.opponentLeftCheckTimer);
+
+    const elapsed = state.roomConnectedAt ? Date.now() - state.roomConnectedAt : Infinity;
+    const SETTLE_BUFFER_MS = 300; // let room.remoteParticipants settle after the event
+    const waitFor = Math.max(0, RING_ENTRY_GRACE_MS - elapsed) + SETTLE_BUFFER_MS;
+
+    console.log(
+      '[OPPOSE] Opponent-left check scheduled in %dms (fires no earlier than %dms after connect; elapsed so far=%dms).',
+      waitFor,
+      RING_ENTRY_GRACE_MS,
+      elapsed
+    );
+
+    state.opponentLeftCheckTimer = setTimeout(() => {
+      state.opponentLeftCheckTimer = null;
+      const remaining = room.remoteParticipants ? room.remoteParticipants.size : 0;
+      console.log('[OPPOSE] Opponent-left check firing. room.remoteParticipants.size=%d', remaining);
+      if (remaining === 0) {
+        handleOpponentLeft();
+      } else {
+        console.log('[OPPOSE] Room still has remote participants — the earlier disconnect was noise, not showing the overlay.');
+      }
+    }, waitFor);
   }
 
   function handleOpponentLeft() {
