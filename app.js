@@ -75,6 +75,7 @@
     ringEntered: false,
     livekitRoom: null,
     roomConnectedAt: null,
+    localTracks: [],
     opponentLeft: false,
   };
 
@@ -544,7 +545,38 @@
 
     disconnectLiveKit(); // clean up any previous session first
 
-    const room = new LK.Room({ adaptiveStream: true, dynacast: true });
+    // 1. Acquire local camera + mic tracks BEFORE connecting to the room.
+    // Doing this up front (instead of via enableCameraAndMicrophone() after
+    // connect) means the browser's getUserMedia prompt/negotiation never
+    // blocks the signalling connection itself.
+    let localTracks = [];
+    try {
+      console.log('[OPPOSE] Step: requesting local camera + microphone tracks (before connect)...');
+      localTracks = await LK.createLocalTracks({ audio: true, video: true });
+      state.localTracks = localTracks;
+      console.log('[OPPOSE] Local tracks acquired:', localTracks.map((t) => t.kind).join(', '));
+    } catch (err) {
+      console.error('[OPPOSE] Error acquiring local camera/mic tracks:', err);
+      showRingError('Нет доступа к камере/микрофону: ' + (err.message || 'проверь разрешения браузера'));
+      // Non-fatal — we still try to join the room so the user can at least
+      // see/hear the opponent even without publishing their own media.
+    }
+
+    // Show the local preview immediately, independent of whether the
+    // room connects or the track ever successfully publishes.
+    const localVideoTrack = localTracks.find((t) => t.kind === 'video');
+    if (localVideoTrack) {
+      localVideoTrack.attach(el.localVideo);
+      showVideoTrack(el.localVideo, el.videoPlaceholderYou);
+    }
+
+    // 3. Explicit vp8 video codec on the room's publish defaults speeds up
+    // the publish handshake and avoids codec-negotiation stalls.
+    const room = new LK.Room({
+      adaptiveStream: true,
+      dynacast: true,
+      publishDefaults: { videoCodec: 'vp8' },
+    });
     state.livekitRoom = room;
 
     room.on(LK.RoomEvent.TrackSubscribed, (track, publication, participant) => {
@@ -628,25 +660,37 @@
       showRingError('Нет доступа к камере/микрофону: ' + (err.message || 'проверь разрешения браузера'));
     });
 
+    // 2. Connect to the signalling server first...
     try {
       console.log('[OPPOSE] Step: connecting to LiveKit room at %s...', LIVEKIT_URL);
       await room.connect(LIVEKIT_URL, token);
       state.roomConnectedAt = Date.now();
       console.log('[OPPOSE] Connected to LiveKit room:', room.name);
-
-      console.log('[OPPOSE] Step: requesting camera + microphone access...');
-      await room.localParticipant.enableCameraAndMicrophone();
-      console.log('[OPPOSE] Camera and microphone enabled.');
-
-      const camPub = room.localParticipant.getTrackPublication(LK.Track.Source.Camera);
-      if (camPub && camPub.videoTrack) {
-        camPub.videoTrack.attach(el.localVideo);
-        showVideoTrack(el.localVideo, el.videoPlaceholderYou);
-      }
       clearRingError();
     } catch (err) {
-      console.error('[OPPOSE] LiveKit connection/media error:', err);
-      showRingError('Ошибка видеосвязи: ' + (err.message || 'не удалось подключиться'));
+      console.error('[OPPOSE] room.connect() failed:', err);
+      showRingError('Не удалось подключиться к видеосвязи: ' + (err.message || 'ошибка соединения'));
+      return; // no point trying to publish without a live connection
+    }
+
+    // ...then publish each already-acquired track separately, each with
+    // its own try/catch. If a publish call times out or fails, we log it
+    // and surface a non-fatal notice — we deliberately do NOT disconnect
+    // the room or trigger the "Связь потеряна" flow over a slow publish.
+    for (const track of localTracks) {
+      try {
+        console.log('[OPPOSE] Step: publishing local track kind=%s...', track.kind);
+        await room.localParticipant.publishTrack(track, {
+          videoCodec: track.kind === 'video' ? 'vp8' : undefined,
+        });
+        console.log('[OPPOSE] Published local track kind=%s successfully.', track.kind);
+      } catch (err) {
+        console.error('[OPPOSE] Publish failed/timed out for track kind=%s:', track.kind, err);
+        showRingError(
+          `Соперник может временно не видеть/слышать тебя (не удалось опубликовать ${track.kind === 'video' ? 'видео' : 'аудио'}). Бой продолжается.`
+        );
+        // No disconnectLiveKit() / handleOpponentLeft() here on purpose.
+      }
     }
   }
 
@@ -673,6 +717,17 @@
   }
 
   function disconnectLiveKit() {
+    if (state.localTracks && state.localTracks.length) {
+      console.log('[OPPOSE] Stopping locally-acquired tracks (published or not)...');
+      state.localTracks.forEach((track) => {
+        try {
+          track.stop();
+        } catch (err) {
+          console.error('[OPPOSE] Error stopping local track:', err);
+        }
+      });
+      state.localTracks = [];
+    }
     if (state.livekitRoom) {
       console.log('[OPPOSE] Disconnecting from LiveKit room...');
       try {
