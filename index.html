@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
 </head>
 <body>
 
@@ -99,7 +100,7 @@
       <button type="button" id="btnBackFromTimeout" class="btn-fight">Вернуться в меню</button>
     </div>
 
-    <p id="mmError" class="mm-error hidden" role="alert"></p>
+    <p id="mmError" class="mm-error hidden" role="alert" style="color:var(--loss); text-align:center; margin-top:16px; font-size:13px;"></p>
   </div>
 </section>
 
@@ -131,8 +132,8 @@
         <div class="video-frame" id="videoFrameYou">
           <div class="video-corner tl"></div><div class="video-corner tr"></div>
           <div class="video-corner bl"></div><div class="video-corner br"></div>
-          <!-- Заготовка под локальный видеопоток (WebRTC подключится позже) -->
-          <video id="localVideo" class="video-el hidden" autoplay muted playsinline></video>
+          <!-- Локальный видеопоток LiveKit -->
+          <video id="local-video" class="video-el hidden" autoplay muted playsinline></video>
           <div class="video-placeholder" id="videoPlaceholderYou">
             <div class="avatar-glow you-glow"></div>
             <span class="video-initial">Т</span>
@@ -148,8 +149,9 @@
         <div class="video-frame" id="videoFrameOpp">
           <div class="video-corner tl"></div><div class="video-corner tr"></div>
           <div class="video-corner bl"></div><div class="video-corner br"></div>
-          <!-- Заготовка под удалённый видеопоток оппонента (WebRTC подключится позже) -->
-          <video id="remoteVideo" class="video-el hidden" autoplay playsinline></video>
+          <!-- Удалённый видеопоток LiveKit (соперник) -->
+          <video id="remote-video" class="video-el hidden" autoplay playsinline></video>
+          <audio id="remote-audio" class="hidden" autoplay></audio>
           <div class="video-placeholder" id="videoPlaceholderOpp">
             <div class="avatar-glow opp-glow"></div>
             <span class="video-initial">О</span>
@@ -165,7 +167,21 @@
       <span class="ai-hint-text" id="aiHintText">Подсказка ИИ: обозначь тезис в первые 10 секунд — судья оценивает структуру.</span>
     </div>
 
+    <p id="ringError" class="hidden" role="alert" style="color:var(--loss); text-align:center; font-size:13px; margin:0;"></p>
+
     <button type="button" id="btnEndFight" class="btn-end">Завершить бой</button>
+
+    <!-- Плашка "соперник покинул ринг" -->
+    <div id="opponentLeftBackdrop" class="verdict-backdrop hidden" style="z-index:2;"></div>
+    <div id="opponentLeftModal" class="verdict-modal glass hidden"
+         style="position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:3; width:90%; max-width:380px;"
+         role="dialog" aria-modal="true" aria-labelledby="opponentLeftTitle">
+      <div class="verdict-judge-mark" aria-hidden="true">🚪</div>
+      <span class="section-eyebrow">Связь потеряна</span>
+      <h2 id="opponentLeftTitle" class="verdict-outcome loss">Соперник покинул ринг</h2>
+      <p class="verdict-text">Оппонент отключился до завершения раунда. Вернись в меню и найди нового соперника.</p>
+      <button type="button" id="btnOpponentLeftMenu" class="btn-fight">Вернуться в меню</button>
+    </div>
   </div>
 </section>
 

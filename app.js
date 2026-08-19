@@ -2,10 +2,12 @@
   'use strict';
 
   /* ============================================================
-     1. Supabase init
+     1. Supabase + LiveKit init
      ============================================================ */
   const SUPABASE_URL = 'https://gjyuudqxbimumpnsesky.supabase.co';
   const SUPABASE_KEY = 'sb_publishable_Q9Y4HCWbc-_tG3-32GB0PQ_x9sYJIIF';
+  const LIVEKIT_URL = 'wss://oppose-nywikotg.livekit.cloud';
+  const LIVEKIT_TOKEN_FUNCTION_URL = 'https://gjyuudqxbimumpnsesky.supabase.co/functions/v1/get-livekit-token';
 
   let sb = null;
   try {
@@ -13,6 +15,15 @@
     console.log('[OPPOSE] Supabase client initialized:', SUPABASE_URL);
   } catch (err) {
     console.error('[OPPOSE] Failed to initialize Supabase client:', err);
+  }
+
+  // The livekit-client UMD bundle exposes itself as `LivekitClient` on window
+  // (Room becomes LivekitClient.Room, RoomEvent becomes LivekitClient.RoomEvent, etc).
+  const LK = window.LivekitClient || null;
+  if (!LK) {
+    console.error('[OPPOSE] LiveKit SDK (LivekitClient) not found on window — check the <script> tag.');
+  } else {
+    console.log('[OPPOSE] LiveKit SDK loaded.');
   }
 
   const QUEUE_TABLE = 'matchmaking_queue';
@@ -61,6 +72,8 @@
     roomId: null,
     myQueueRowId: null,
     ringEntered: false,
+    livekitRoom: null,
+    opponentLeft: false,
   };
 
   const RANKS = [
@@ -146,6 +159,17 @@
     timerProgress: document.getElementById('timerProgress'),
     aiHintText: document.getElementById('aiHintText'),
     btnEndFight: document.getElementById('btnEndFight'),
+    ringError: document.getElementById('ringError'),
+
+    localVideo: document.getElementById('local-video'),
+    remoteVideo: document.getElementById('remote-video'),
+    remoteAudio: document.getElementById('remote-audio'),
+    videoPlaceholderYou: document.getElementById('videoPlaceholderYou'),
+    videoPlaceholderOpp: document.getElementById('videoPlaceholderOpp'),
+
+    opponentLeftBackdrop: document.getElementById('opponentLeftBackdrop'),
+    opponentLeftModal: document.getElementById('opponentLeftModal'),
+    btnOpponentLeftMenu: document.getElementById('btnOpponentLeftMenu'),
 
     verdictOutcome: document.getElementById('verdictOutcome'),
     verdictText: document.getElementById('verdictText'),
@@ -173,7 +197,7 @@
   }
 
   function showMmError(message) {
-    console.error('[OPPOSE] UI error:', message);
+    console.error('[OPPOSE] UI error (matchmaking):', message);
     el.mmError.textContent = message;
     el.mmError.classList.remove('hidden');
   }
@@ -181,6 +205,19 @@
   function clearMmError() {
     el.mmError.textContent = '';
     el.mmError.classList.add('hidden');
+  }
+
+  function showRingError(message) {
+    console.error('[OPPOSE] UI error (ring):', message);
+    if (!el.ringError) return;
+    el.ringError.textContent = message;
+    el.ringError.classList.remove('hidden');
+  }
+
+  function clearRingError() {
+    if (!el.ringError) return;
+    el.ringError.textContent = '';
+    el.ringError.classList.add('hidden');
   }
 
   /* ============================================================
@@ -246,6 +283,7 @@
 
     clearMmError();
     state.ringEntered = false;
+    state.opponentLeft = false;
     state.roomId = null;
     state.myQueueRowId = null;
     const categoryLabel = CATEGORY_LABELS[state.category];
@@ -273,7 +311,6 @@
     }, SEARCH_TIMEOUT_MS);
 
     try {
-      // 3a. Look for an opponent already waiting in the same category.
       console.log('[OPPOSE] Step: searching for a waiting opponent in category "%s"...', categoryLabel);
       const { data: candidates, error: selectError } = await sb
         .from(QUEUE_TABLE)
@@ -357,8 +394,6 @@
   }
 
   async function enterQueueAndWait(categoryLabel) {
-    // Insert our own row as 'waiting' with user_id set on every request,
-    // as required by the matchmaking_queue schema.
     const { data: myRow, error: insertError } = await sb
       .from(QUEUE_TABLE)
       .insert({
@@ -376,8 +411,6 @@
     state.myQueueRowId = myRow && myRow[0] ? myRow[0].id : null;
     console.log('[OPPOSE] Inserted waiting row. id=%s user_id=%s', state.myQueueRowId, state.userId);
 
-    // Subscribe to realtime UPDATE events on our own row, filtered by
-    // user_id, so we're notified the instant another client matches us.
     subscribeToOwnRow();
   }
 
@@ -405,7 +438,7 @@
       .subscribe((status) => {
         console.log('[OPPOSE] Realtime channel status:', status);
         if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-          showMmError('Проблема с realtime-подключением. Продолжаем ждать через опрос.');
+          showMmError('Проблема с realtime-подключением. Продолжаем ждать...');
         }
       });
   }
@@ -474,9 +507,160 @@
   });
 
   /* ============================================================
+     4. LiveKit video chat
+     ============================================================ */
+  async function connectToLiveKit(roomId) {
+    if (!LK) {
+      showRingError('Видео недоступно: LiveKit SDK не загружен.');
+      return;
+    }
+
+    console.log('[OPPOSE] Step: requesting LiveKit token for room=%s user=%s', roomId, state.userId);
+    let token;
+    try {
+      const res = await fetch(LIVEKIT_TOKEN_FUNCTION_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room: roomId, username: state.userId }),
+      });
+      if (!res.ok) {
+        throw new Error(`Функция выдачи токена вернула статус ${res.status}`);
+      }
+      const data = await res.json();
+      token = data.token || data.accessToken || data.jwt;
+      if (!token) throw new Error('В ответе функции не найден токен доступа');
+      console.log('[OPPOSE] LiveKit token received.');
+    } catch (err) {
+      console.error('[OPPOSE] Failed to fetch LiveKit token:', err);
+      showRingError('Не удалось получить токен видеосвязи: ' + (err.message || 'ошибка сети'));
+      return;
+    }
+
+    disconnectLiveKit(); // clean up any previous session first
+
+    const room = new LK.Room({ adaptiveStream: true, dynacast: true });
+    state.livekitRoom = room;
+
+    room.on(LK.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      console.log('[OPPOSE] TrackSubscribed: kind=%s from=%s', track.kind, participant.identity);
+      if (track.kind === 'video') {
+        track.attach(el.remoteVideo);
+        showVideoTrack(el.remoteVideo, el.videoPlaceholderOpp);
+      } else if (track.kind === 'audio' && el.remoteAudio) {
+        track.attach(el.remoteAudio);
+      }
+    });
+
+    room.on(LK.RoomEvent.TrackUnsubscribed, (track) => {
+      console.log('[OPPOSE] TrackUnsubscribed: kind=%s', track.kind);
+      track.detach();
+    });
+
+    // 5. Auto-sync: opponent leaving the room.
+    room.on(LK.RoomEvent.ParticipantDisconnected, (participant) => {
+      console.warn('[OPPOSE] ParticipantDisconnected:', participant.identity);
+      handleOpponentLeft();
+    });
+
+    room.on(LK.RoomEvent.Disconnected, (reason) => {
+      console.log('[OPPOSE] LiveKit room disconnected. reason=', reason);
+    });
+
+    room.on(LK.RoomEvent.MediaDevicesError, (err) => {
+      console.error('[OPPOSE] MediaDevicesError:', err);
+      showRingError('Нет доступа к камере/микрофону: ' + (err.message || 'проверь разрешения браузера'));
+    });
+
+    try {
+      console.log('[OPPOSE] Step: connecting to LiveKit room at %s...', LIVEKIT_URL);
+      await room.connect(LIVEKIT_URL, token);
+      console.log('[OPPOSE] Connected to LiveKit room:', room.name);
+
+      console.log('[OPPOSE] Step: requesting camera + microphone access...');
+      await room.localParticipant.enableCameraAndMicrophone();
+      console.log('[OPPOSE] Camera and microphone enabled.');
+
+      const camPub = room.localParticipant.getTrackPublication(LK.Track.Source.Camera);
+      if (camPub && camPub.videoTrack) {
+        camPub.videoTrack.attach(el.localVideo);
+        showVideoTrack(el.localVideo, el.videoPlaceholderYou);
+      }
+      clearRingError();
+    } catch (err) {
+      console.error('[OPPOSE] LiveKit connection/media error:', err);
+      showRingError('Ошибка видеосвязи: ' + (err.message || 'не удалось подключиться'));
+    }
+  }
+
+  function showVideoTrack(videoEl, placeholderEl) {
+    videoEl.classList.remove('hidden');
+    Object.assign(videoEl.style, {
+      position: 'absolute',
+      inset: '0',
+      width: '100%',
+      height: '100%',
+      objectFit: 'cover',
+      borderRadius: 'inherit',
+      zIndex: '1',
+    });
+    if (placeholderEl) placeholderEl.style.display = 'none';
+  }
+
+  function resetVideoTrack(videoEl, placeholderEl) {
+    if (videoEl) {
+      videoEl.classList.add('hidden');
+      videoEl.srcObject = null;
+    }
+    if (placeholderEl) placeholderEl.style.display = '';
+  }
+
+  function disconnectLiveKit() {
+    if (state.livekitRoom) {
+      console.log('[OPPOSE] Disconnecting from LiveKit room...');
+      try {
+        state.livekitRoom.disconnect();
+      } catch (err) {
+        console.error('[OPPOSE] Error while disconnecting LiveKit room:', err);
+      }
+      state.livekitRoom = null;
+    }
+    resetVideoTrack(el.localVideo, el.videoPlaceholderYou);
+    resetVideoTrack(el.remoteVideo, el.videoPlaceholderOpp);
+    if (el.remoteAudio) el.remoteAudio.srcObject = null;
+  }
+
+  function handleOpponentLeft() {
+    if (state.opponentLeft) return;
+    state.opponentLeft = true;
+
+    console.warn('[OPPOSE] Opponent left the ring — showing notice.');
+    stopRingTimers();
+    disconnectLiveKit();
+    el.opponentLeftBackdrop.classList.remove('hidden');
+    el.opponentLeftModal.classList.remove('hidden');
+
+    // The fight is effectively over — clean up our own queue row too.
+    if (state.userId) {
+      sb.from(QUEUE_TABLE).delete().eq('user_id', state.userId).then(({ error }) => {
+        if (error) console.error('[OPPOSE] Error cleaning up queue row after opponent left:', error);
+      });
+    }
+  }
+
+  el.btnOpponentLeftMenu.addEventListener('click', () => {
+    el.opponentLeftBackdrop.classList.add('hidden');
+    el.opponentLeftModal.classList.add('hidden');
+    state.opponentLeft = false;
+    clearRingError();
+    renderUserCard();
+    showScreen('menu');
+  });
+
+  /* ============================================================
      Screen 3 — Ring / fight
      ============================================================ */
   function enterRing(topic, role) {
+    clearRingError();
     el.ringTopic.textContent = topic || pick(TOPICS[state.category]);
     state.role = role || (Math.random() < 0.5 ? 'ЗА' : 'ПРОТИВ');
     el.ringRole.innerHTML = `Ты: <strong>${state.role}</strong>`;
@@ -485,6 +669,10 @@
     showScreen('ring');
     startPhase(0);
     startHintRotation();
+
+    // Fire-and-forget: connect to the LiveKit room in the background so
+    // the ring UI is never blocked waiting on camera/mic permissions.
+    connectToLiveKit(state.roomId);
   }
 
   function startPhase(index) {
@@ -535,7 +723,9 @@
      Screen 4 — Verdict
      ============================================================ */
   function endFight() {
+    if (state.opponentLeft) return; // already handled by the opponent-left flow
     stopRingTimers();
+    disconnectLiveKit();
 
     const won = Math.random() < 0.55; // slight favor to keep the demo encouraging
     const delta = won ? (18 + Math.floor(Math.random() * 15)) : -(10 + Math.floor(Math.random() * 15));
@@ -558,17 +748,49 @@
 
     // Best-effort cleanup of our queue row now that the fight is over.
     console.log('[OPPOSE] Step: cleaning up queue row after fight end...');
-    sb.from(QUEUE_TABLE).delete().eq('user_id', state.userId).then(
-      ({ error }) => {
-        if (error) console.error('[OPPOSE] Error cleaning up queue row:', error);
-        else console.log('[OPPOSE] Queue row cleaned up.');
-      }
-    );
+    sb.from(QUEUE_TABLE).delete().eq('user_id', state.userId).then(({ error }) => {
+      if (error) console.error('[OPPOSE] Error cleaning up queue row:', error);
+      else console.log('[OPPOSE] Queue row cleaned up.');
+    });
   }
 
   el.btnReturnMenu.addEventListener('click', () => {
     renderUserCard();
     showScreen('menu');
+  });
+
+  /* ============================================================
+     6. Cleanup on tab close / navigation away
+     ============================================================ */
+  window.addEventListener('beforeunload', () => {
+    console.log('[OPPOSE] beforeunload: releasing resources...');
+
+    // Leave the LiveKit room immediately (best-effort, no await possible here).
+    if (state.livekitRoom) {
+      try {
+        state.livekitRoom.disconnect();
+      } catch (err) {
+        console.error('[OPPOSE] beforeunload: error disconnecting LiveKit room:', err);
+      }
+    }
+
+    // A plain supabase-js call is a Promise that the browser won't wait for
+    // during unload, so we issue a raw keepalive fetch straight to the
+    // Supabase REST endpoint to make sure the row actually gets removed.
+    if (state.userId) {
+      try {
+        fetch(`${SUPABASE_URL}/rest/v1/${QUEUE_TABLE}?user_id=eq.${encodeURIComponent(state.userId)}`, {
+          method: 'DELETE',
+          keepalive: true,
+          headers: {
+            apikey: SUPABASE_KEY,
+            Authorization: `Bearer ${SUPABASE_KEY}`,
+          },
+        });
+      } catch (err) {
+        console.error('[OPPOSE] beforeunload: error cleaning up queue row:', err);
+      }
+    }
   });
 
   /* ============================================================
