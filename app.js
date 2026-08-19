@@ -520,7 +520,11 @@
     try {
       const res = await fetch(LIVEKIT_TOKEN_FUNCTION_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': SUPABASE_KEY,
+          'Authorization': 'Bearer ' + SUPABASE_KEY,
+        },
         body: JSON.stringify({ room: roomId, username: state.userId }),
       });
       if (!res.ok) {
